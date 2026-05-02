@@ -1,0 +1,1503 @@
+import asyncio
+import json
+import logging
+import os
+import pathlib
+import random
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from datetime import time as dt_time
+from typing import (
+    Annotated,
+    Awaitable,
+    BinaryIO,
+    Callable,
+    Generic,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
+
+from croniter import CroniterBadCronError, croniter
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pyrogram import Client as BaseClient
+from pyrogram import errors
+from pyrogram.enums import ChatType
+from pyrogram.handlers import EditedMessageHandler, MessageHandler
+from pyrogram.session import Session
+from pyrogram.storage import SQLiteStorage
+from pyrogram.types import (
+    Chat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Object,
+    User,
+)
+
+from telegram_signer.config import (
+    ActionT,
+    BaseJSONConfig,
+    ChatId,
+    ChooseOptionByImageAction,
+    ClickKeyboardByTextAction,
+    ReplyByCalculationProblemAction,
+    SendDiceAction,
+    SendTextAction,
+    SignChatV3,
+    SignConfigV3,
+    SolveSlotMachineCaptchaAction,
+    SupportAction,
+    normalize_chat_username,
+    parse_chat_id_or_username,
+)
+
+from ._kurigram import SafeGetForumTopics
+from .ai_tools import AITools, OpenAIConfigManager
+from .sign_record_store import SignRecordStore
+from .utils import UserInput, get_now, print_to_user
+from .utils import get_timezone as _get_timezone
+
+logger = logging.getLogger("telegram-signer")
+
+DICE_EMOJIS = ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰")
+
+Session.START_TIMEOUT = 5
+
+OPENAI_USE_PROMPT = (
+    "This task uses LLM features. Set OPENAI_API_KEY, OPENAI_BASE_URL, "
+    "and OPENAI_MODEL, or run `telegram-signer <account> llm-config` first."
+)
+
+CHAT_TYPE_LABELS = {
+    ChatType.BOT: "BOT",
+    ChatType.GROUP: "group",
+    ChatType.SUPERGROUP: "supergroup",
+    ChatType.CHANNEL: "channel",
+    ChatType.FORUM: "forum",
+    ChatType.DIRECT: "channel direct",
+}
+
+
+def readable_message(message: Message):
+    s = "\nMessage: "
+    s += f"\n  text: {message.text or ''}"
+    if message.photo:
+        s += f"\n  photo: [({message.photo.width}x{message.photo.height}) {message.caption}]"
+    if message.reply_markup:
+        if isinstance(message.reply_markup, InlineKeyboardMarkup):
+            s += "\n  InlineKeyboard: "
+            for row in message.reply_markup.inline_keyboard:
+                s += "\n   "
+                for button in row:
+                    s += f"{button.text} | "
+    return s
+
+
+def readable_chat(chat: Chat):
+    type_ = CHAT_TYPE_LABELS.get(chat.type, "private")
+
+    none_or_dash = lambda x: x or "-"  # noqa: E731
+
+    return f"id: {chat.id}, username: {none_or_dash(chat.username)}, title: {none_or_dash(chat.title)}, type: {type_}, name: {none_or_dash(chat.first_name)}"
+
+
+def chat_has_forum_topics(chat: Chat) -> bool:
+    return chat.type == ChatType.FORUM or (
+        chat.type == ChatType.SUPERGROUP and chat.is_forum
+    )
+
+
+def readable_topic(topic) -> str:
+    none_or_dash = lambda x: x or "-"  # noqa: E731
+    return (
+        f"message_thread_id: {topic.id}, title: {none_or_dash(topic.title)}, "
+        f"closed: {bool(getattr(topic, 'is_closed', False))}, "
+        f"pinned: {bool(getattr(topic, 'is_pinned', False))}"
+    )
+
+
+_CLIENT_INSTANCES: dict[str, "Client"] = {}
+
+# reference counts and async locks for shared client lifecycle management
+# Keyed by account name. Use asyncio locks to serialize start/stop operations
+# so multiple coroutines in the same process can safely share one Client.
+_CLIENT_REFS: defaultdict[str, int] = defaultdict(int)
+_CLIENT_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+
+# login bootstrap state keyed by account key. This prevents concurrent tasks
+# from repeatedly calling get_me/get_dialogs for the same account.
+_LOGIN_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+_LOGIN_USERS: dict[str, User] = {}
+
+_API_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+_API_LAST_CALL_AT: dict[str, float] = {}
+_API_MIN_INTERVAL_SECONDS = 0.35
+_API_FLOODWAIT_PADDING_SECONDS = 0.5
+_API_MAX_FLOODWAIT_RETRIES = 2
+
+RouteKey = tuple[ChatId, Optional[int]]
+get_timezone = _get_timezone
+
+SLOT_MACHINE_EMOJI = "\U0001f3b0"
+SLOT_MACHINE_SYMBOLS = ("bar", "grapes", "lemon", "seven")
+SLOT_MACHINE_SYMBOL_ALIASES = {
+    "bar": {
+        "bar",
+        "-",
+        "−",
+        "➖",
+        "i i i",
+        "iii",
+        "|||",
+        "\u2503\u2503\u2503",
+        "\u258c\u258c\u258c",
+        "\u25ae\u25ae\u25ae",
+        "\u25b0\u25b0\u25b0",
+        "\u25a0\u25a0\u25a0",
+        "\u2588\u2588\u2588",
+    },
+    "grapes": {"grape", "grapes", "\U0001f347", "\u8461\u8404"},
+    "lemon": {"lemon", "\U0001f34b", "\u67e0\u6aac"},
+    "seven": {"7", "seven", "777", "\u0037\ufe0f\u20e3", "\u4e03"},
+}
+
+
+class Client(SafeGetForumTopics, BaseClient):
+    def __init__(self, name: str, *args, **kwargs):
+        key = kwargs.pop("key", None)
+        super().__init__(name, *args, **kwargs)
+        self.key = key or str(pathlib.Path(self.workdir).joinpath(self.name).resolve())
+        if self.in_memory and not self.session_string:
+            self.load_session_string()
+            self.storage = SQLiteStorage(
+                name=self.name,
+                workdir=self.workdir,
+                session_string=self.session_string,
+                in_memory=True,
+            )
+
+    async def __aenter__(self):
+        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CLIENT_ASYNC_LOCKS[self.key] = lock
+        async with lock:
+            _CLIENT_REFS[self.key] += 1
+            if _CLIENT_REFS[self.key] == 1:
+                try:
+                    await self.start()
+                except ConnectionError:
+                    pass
+            return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
+        if lock is None:
+            return
+        async with lock:
+            _CLIENT_REFS[self.key] -= 1
+            if _CLIENT_REFS[self.key] == 0:
+                try:
+                    await self.stop()
+                except ConnectionError:
+                    pass
+                _CLIENT_INSTANCES.pop(self.key, None)
+
+    @property
+    def session_string_file(self):
+        return self.workdir / (self.name + ".session_string")
+
+    async def save_session_string(self):
+        with open(self.session_string_file, "w") as fp:
+            fp.write(await self.export_session_string())
+
+    def load_session_string(self):
+        logger.info("Loading session_string from local file.")
+        if self.session_string_file.is_file():
+            with open(self.session_string_file, "r") as fp:
+                self.session_string = fp.read()
+                logger.info("The session_string has been loaded.")
+        return self.session_string
+
+    async def log_out(self):
+        await super().log_out()
+        if self.session_string_file.is_file():
+            os.remove(self.session_string_file)
+
+
+def get_api_config():
+    api_id = int(os.environ.get("TG_API_ID", 611335))
+    api_hash = os.environ.get("TG_API_HASH", "d524b414d21f4d37f08684c1df41ac9c")
+    return api_id, api_hash
+
+
+def get_client(
+    name: str = "my_account",
+    workdir: Union[str, pathlib.Path] = ".",
+    session_string: str = None,
+    in_memory: bool = False,
+    **kwargs,
+) -> Client:
+    api_id, api_hash = get_api_config()
+    key = str(pathlib.Path(workdir).joinpath(name).resolve())
+    if key in _CLIENT_INSTANCES:
+        return _CLIENT_INSTANCES[key]
+    client = Client(
+        name,
+        api_id=api_id,
+        api_hash=api_hash,
+        workdir=workdir,
+        session_string=session_string,
+        in_memory=in_memory,
+        key=key,
+        **kwargs,
+    )
+    _CLIENT_INSTANCES[key] = client
+    return client
+
+
+def make_dirs(path: pathlib.Path, exist_ok=True):
+    path = pathlib.Path(path)
+    if not path.is_dir():
+        os.makedirs(path, exist_ok=exist_ok)
+    return path
+
+
+ConfigT = TypeVar("ConfigT", bound=BaseJSONConfig)
+ApiCallResultT = TypeVar("ApiCallResultT")
+
+
+class BaseUserWorker(Generic[ConfigT]):
+    _workdir = "."
+    _tasks_dir = "tasks"
+    cfg_cls: Type["ConfigT"] = BaseJSONConfig
+
+    def __init__(
+        self,
+        task_name: str = None,
+        session_dir: str = ".",
+        account: str = "my_account",
+        workdir=None,
+        session_string: str = None,
+        in_memory: bool = False,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ):
+        self.task_name = task_name or "my_task"
+        self._session_dir = pathlib.Path(session_dir)
+        self._account = account
+        if workdir:
+            self._workdir = pathlib.Path(workdir)
+        self.app = get_client(
+            account,
+            workdir=self._session_dir,
+            session_string=session_string,
+            in_memory=in_memory,
+            loop=loop,
+        )
+        self.loop = self.app.loop
+        self.user: Optional[User] = None
+        self._config = None
+        self.context = self.ensure_ctx()
+
+    def ensure_ctx(self):
+        return {}
+
+    def app_run(self, coroutine=None):
+        if coroutine is not None:
+            run = self.loop.run_until_complete
+            run(coroutine)
+        else:
+            self.app.run()
+
+    @property
+    def workdir(self) -> pathlib.Path:
+        workdir = self._workdir
+        make_dirs(workdir)
+        return pathlib.Path(workdir)
+
+    @property
+    def tasks_dir(self):
+        tasks_dir = self.workdir / self._tasks_dir
+        make_dirs(tasks_dir)
+        return pathlib.Path(tasks_dir)
+
+    @property
+    def task_dir(self):
+        task_dir = self.tasks_dir / self.task_name
+        make_dirs(task_dir)
+        return task_dir
+
+    def get_user_dir(self, user: User):
+        user_dir = self.workdir / "users" / str(user.id)
+        make_dirs(user_dir)
+        return user_dir
+
+    @property
+    def config_file(self):
+        return self.task_dir.joinpath("config.json")
+
+    @property
+    def legacy_config_files(self) -> list[pathlib.Path]:
+        return []
+
+    @property
+    def legacy_tasks_dirs(self) -> list[pathlib.Path]:
+        return []
+
+    @property
+    def config(self) -> ConfigT:
+        return self._config or self.load_config()
+
+    @config.setter
+    def config(self, value):
+        self._config = value
+
+    def log(self, msg, level: str = "INFO", **kwargs):
+        msg = f"account={self._account} task={self.task_name}: {msg}"
+        if level.upper() == "INFO":
+            logger.info(msg, **kwargs)
+        elif level.upper() == "WARNING":
+            logger.warning(msg, **kwargs)
+        elif level.upper() == "ERROR":
+            logger.error(msg, **kwargs)
+        elif level.upper() == "CRITICAL":
+            logger.critical(msg, **kwargs)
+        else:
+            logger.debug(msg, **kwargs)
+
+    async def _call_telegram_api(
+        self,
+        operation: str,
+        call: Callable[[], Awaitable[ApiCallResultT]],
+        *,
+        retry_on_floodwait: bool = True,
+    ) -> ApiCallResultT:
+        key = self.app.key
+        lock = _API_ASYNC_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _API_ASYNC_LOCKS[key] = lock
+
+        retries_left = _API_MAX_FLOODWAIT_RETRIES
+        while True:
+            async with lock:
+                loop = asyncio.get_running_loop()
+                last_called_at = _API_LAST_CALL_AT.get(key)
+                if last_called_at is not None:
+                    wait_for = _API_MIN_INTERVAL_SECONDS - (
+                        loop.time() - last_called_at
+                    )
+                    if wait_for > 0:
+                        await asyncio.sleep(wait_for)
+                try:
+                    result = await call()
+                    _API_LAST_CALL_AT[key] = loop.time()
+                    return result
+                except errors.FloodWait as e:
+                    _API_LAST_CALL_AT[key] = loop.time()
+                    if not retry_on_floodwait or retries_left <= 0:
+                        raise
+                    retries_left -= 1
+                    wait_seconds = (
+                        max(float(getattr(e, "value", 0) or 0), 0)
+                        + _API_FLOODWAIT_PADDING_SECONDS
+                    )
+                    self.log(
+                        f"{operation} hit FloodWait; wait {wait_seconds:.1f}s before retry; retries left  {retries_left} )",
+                        level="WARNING",
+                    )
+                    await asyncio.sleep(wait_seconds)
+
+    def ask_for_config(self):
+        raise NotImplementedError
+
+    def write_config(self, config: BaseJSONConfig):
+        with open(self.config_file, "w", encoding="utf-8") as fp:
+            json.dump(config.to_jsonable(), fp, ensure_ascii=False)
+
+    def reconfig(self):
+        config = self.ask_for_config()
+        self.write_config(config)
+        return config
+
+    def load_config(self, cfg_cls: Type[ConfigT] = None) -> ConfigT:
+        cfg_cls = cfg_cls or self.cfg_cls
+        config_file = self.config_file
+        for legacy_config_file in self.legacy_config_files:
+            if config_file.exists():
+                break
+            if legacy_config_file.exists():
+                config_file = legacy_config_file
+                break
+
+        if not config_file.exists():
+            config = self.reconfig()
+        else:
+            with open(config_file, "r", encoding="utf-8") as fp:
+                config, from_old = cfg_cls.load(json.load(fp))
+                if from_old or config_file != self.config_file:
+                    self.write_config(config)
+        self.config = config
+        return config
+
+    def get_task_list(self):
+        task_names = set()
+        for tasks_dir in [self.tasks_dir, *self.legacy_tasks_dirs]:
+            if not tasks_dir.is_dir():
+                continue
+            for d in os.listdir(tasks_dir):
+                if tasks_dir.joinpath(d).is_dir():
+                    task_names.add(d)
+        return sorted(task_names)
+
+    def list_(self):
+        for d in self.get_task_list():
+            print_to_user(d)
+
+    def set_me(self, user: User):
+        self.user = user
+        with open(
+            self.get_user_dir(user).joinpath("me.json"), "w", encoding="utf-8"
+        ) as fp:
+            fp.write(str(user))
+
+    async def login(self, num_of_dialogs=20, print_chat=True):
+        self.log("Starting login...")
+        app = self.app
+        key = app.key
+        lock = _LOGIN_ASYNC_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _LOGIN_ASYNC_LOCKS[key] = lock
+
+        async with lock:
+            me = _LOGIN_USERS.get(key)
+            if me is None:
+                async with app:
+                    me = await self._call_telegram_api("users.GetFullUser", app.get_me)
+
+                    async def load_latest_chats():
+                        chats = []
+                        latest_chats = []
+                        async for dialog in app.get_dialogs(limit=num_of_dialogs):
+                            chat = dialog.chat
+                            chats.append(chat)
+                            latest_chats.append(
+                                {
+                                    "id": chat.id,
+                                    "title": chat.title,
+                                    "type": chat.type,
+                                    "username": chat.username,
+                                    "first_name": chat.first_name,
+                                    "last_name": chat.last_name,
+                                }
+                            )
+                        return chats, latest_chats
+
+                    chats, latest_chats = await self._call_telegram_api(
+                        "messages.GetDialogs", load_latest_chats
+                    )
+
+                    if print_chat:
+                        for chat in chats:
+                            print_to_user(readable_chat(chat))
+                            if chat_has_forum_topics(chat):
+                                try:
+                                    topics = await asyncio.wait_for(
+                                        self.get_forum_topics(chat.id, limit=20),
+                                        timeout=5,
+                                    )
+                                    for topic in topics:
+                                        print_to_user(f"  {readable_topic(topic)}")
+                                except (asyncio.TimeoutError, errors.RPCError):
+                                    # Keep login robust: many chats don't support
+                                    # forum topics or the current account may not
+                                    # have permissions to read them.
+                                    pass
+
+                    with open(
+                        self.get_user_dir(me).joinpath("latest_chats.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as fp:
+                        json.dump(
+                            latest_chats,
+                            fp,
+                            indent=4,
+                            default=Object.default,
+                            ensure_ascii=False,
+                        )
+                    await self._call_telegram_api(
+                        "auth.ExportAuthorization", self.app.save_session_string
+                    )
+                _LOGIN_USERS[key] = me
+            else:
+                self.log("Reusing cached login bootstrap for this account")
+            self.set_me(me)
+
+    async def logout(self):
+        self.log("Starting logout...")
+        is_authorized = await self.app.connect()
+        if not is_authorized:
+            await self.app.storage.delete()
+            _LOGIN_USERS.pop(self.app.key, None)
+            self.user = None
+            return None
+        result = await self.app.log_out()
+        _LOGIN_USERS.pop(self.app.key, None)
+        self.user = None
+        return result
+
+    async def send_message(
+        self,
+        chat_id: Union[int, str],
+        text: str,
+        delete_after: int = None,
+        message_thread_id: Optional[int] = None,
+        **kwargs,
+    ):
+        """
+        Send a text message
+        :param chat_id:
+        :param text:
+        :param delete_after: Seconds before deletion. None keeps the message; 0 deletes immediately.
+        :param message_thread_id: Forum topic id
+        :param kwargs:
+        :return:
+        """
+        send_kwargs = dict(kwargs)
+        if message_thread_id is not None:
+            send_kwargs["message_thread_id"] = message_thread_id
+        message = await self._call_telegram_api(
+            "messages.SendMessage",
+            lambda: self.app.send_message(chat_id, text, **send_kwargs),
+        )
+        if delete_after is not None:
+            self.log(
+                f"Message「{text}」 to {chat_id} will be deleted after {delete_after} seconds."
+            )
+            self.log("Waiting...")
+            await asyncio.sleep(delete_after)
+            await self._call_telegram_api("messages.DeleteMessages", message.delete)
+            self.log(f"Message「{text}」 to {chat_id} deleted!")
+        return message
+
+    async def send_dice(
+        self,
+        chat_id: Union[int, str],
+        emoji: str = "🎲",
+        delete_after: int = None,
+        message_thread_id: Optional[int] = None,
+        **kwargs,
+    ):
+        """
+        Send a dice message
+        :param chat_id:
+        :param emoji: Should be one of "🎲", "🎯", "🏀", "⚽", "🎳", or "🎰".
+        :param delete_after:
+        :param kwargs:
+        :return:
+        """
+        emoji = emoji.strip()
+        if emoji not in DICE_EMOJIS:
+            self.log(
+                f"Warning, emoji should be one of {', '.join(DICE_EMOJIS)}",
+                level="WARNING",
+            )
+        send_kwargs = dict(kwargs)
+        if message_thread_id is not None:
+            send_kwargs["message_thread_id"] = message_thread_id
+        message = await self._call_telegram_api(
+            "messages.SendMedia",
+            lambda: self.app.send_dice(chat_id, emoji, **send_kwargs),
+        )
+        if message and delete_after is not None:
+            self.log(
+                f"Dice「{emoji}」 to {chat_id} will be deleted after {delete_after} seconds."
+            )
+            self.log("Waiting...")
+            await asyncio.sleep(delete_after)
+            await self._call_telegram_api("messages.DeleteMessages", message.delete)
+            self.log(f"Dice「{emoji}」 to {chat_id} deleted!")
+        return message
+
+    async def get_forum_topics(self, chat_id: Union[int, str], limit: int = 20):
+        topics = []
+
+        async def _collect_topics():
+            async for topic in self.app.get_forum_topics(chat_id, limit=limit):
+                topics.append(topic)
+            return topics
+
+        return await self._call_telegram_api("channels.GetForumTopics", _collect_topics)
+
+    def ask_one(self):
+        raise NotImplementedError
+
+    def ensure_ai_cfg(self):
+        cfg_manager = OpenAIConfigManager(self.workdir)
+        cfg = cfg_manager.load_config()
+        if not cfg:
+            cfg = cfg_manager.ask_for_config()
+        return cfg
+
+    def get_ai_tools(self):
+        return AITools(self.ensure_ai_cfg())
+
+
+class Waiter:
+    def __init__(self):
+        self.waiting_ids = set()
+        self.waiting_counter = Counter()
+
+    def add(self, elm):
+        self.waiting_ids.add(elm)
+        self.waiting_counter[elm] += 1
+
+    def discard(self, elm):
+        self.waiting_ids.discard(elm)
+        self.waiting_counter.pop(elm, None)
+
+    def sub(self, elm):
+        self.waiting_counter[elm] -= 1
+        if self.waiting_counter[elm] <= 0:
+            self.discard(elm)
+
+    def clear(self):
+        self.waiting_ids.clear()
+        self.waiting_counter.clear()
+
+    def __bool__(self):
+        return bool(self.waiting_ids)
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}: {self.waiting_counter}>"
+
+
+class UserSignerWorkerContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    waiter: Waiter
+    sign_chats: defaultdict[RouteKey, list[SignChatV3]]  # check-in chat configs
+    resolved_route_keys: dict[RouteKey, RouteKey]
+    chat_messages: defaultdict[
+        RouteKey,
+        Annotated[
+            dict[int, Optional[Message]],
+            Field(default_factory=dict),
+        ],
+    ]  # received messages keyed by (chat id, message_thread_id)
+    waiting_message: Optional[Message]  # message currently being handled
+    slot_machine_results: dict[RouteKey, tuple[int, tuple[str, str, str]]]
+
+
+class UserSigner(BaseUserWorker[SignConfigV3]):
+    _workdir = ".signer"
+    _tasks_dir = pathlib.Path("telegram-signer") / "config"
+    cfg_cls = SignConfigV3
+    context: UserSignerWorkerContext
+
+    def ensure_ctx(self) -> UserSignerWorkerContext:
+        return UserSignerWorkerContext(
+            waiter=Waiter(),
+            sign_chats=defaultdict(list),
+            resolved_route_keys={},
+            chat_messages=defaultdict(dict),
+            waiting_message=None,
+            slot_machine_results={},
+        )
+
+    @property
+    def sign_record_store(self) -> SignRecordStore:
+        return SignRecordStore(self.workdir)
+
+    @property
+    def legacy_task_dir(self) -> pathlib.Path:
+        return self.workdir / "signs" / self.task_name
+
+    @property
+    def legacy_config_files(self) -> list[pathlib.Path]:
+        return [self.legacy_task_dir / "config.json"]
+
+    @property
+    def legacy_tasks_dirs(self) -> list[pathlib.Path]:
+        return [self.workdir / "signs"]
+
+    @staticmethod
+    def get_route_key(
+        chat_id: ChatId, message_thread_id: Optional[int] = None
+    ) -> RouteKey:
+        return chat_id, message_thread_id
+
+    async def resolve_chat_route_key(self, chat: SignChatV3) -> RouteKey:
+        route_key = self.get_route_key(chat.chat_id, chat.message_thread_id)
+        resolved_route_key = self.context.resolved_route_keys.get(route_key)
+        if resolved_route_key is not None:
+            return resolved_route_key
+        if isinstance(chat.chat_id, int):
+            resolved_route_key = route_key
+        else:
+            resolved_chat = await self._call_telegram_api(
+                "contacts.ResolveUsername",
+                lambda: self.app.get_chat(chat.chat_id),
+            )
+            resolved_route_key = self.get_route_key(
+                resolved_chat.id, chat.message_thread_id
+            )
+        self.context.resolved_route_keys[route_key] = resolved_route_key
+        return resolved_route_key
+
+    def get_runtime_route_key(self, chat: SignChatV3) -> RouteKey:
+        route_key = self.get_route_key(chat.chat_id, chat.message_thread_id)
+        return self.context.resolved_route_keys.get(route_key, route_key)
+
+    @staticmethod
+    def _config_chat_matches(chat: Chat, chat_id: ChatId) -> bool:
+        if isinstance(chat_id, int):
+            return chat.id == chat_id
+        if not chat.username:
+            return False
+        return normalize_chat_username(chat_id) == normalize_chat_username(
+            chat.username
+        )
+
+    async def ensure_config_chats_seen(self, config: SignConfigV3) -> None:
+        targets = {chat.chat_id for chat in config.chats}
+        if not targets:
+            return
+
+        async def load_config_dialogs():
+            unresolved = set(targets)
+            async for dialog in self.app.get_dialogs(limit=0):
+                dialog_chat = dialog.chat
+                for chat_id in list(unresolved):
+                    if self._config_chat_matches(dialog_chat, chat_id):
+                        unresolved.remove(chat_id)
+                if not unresolved:
+                    break
+            return unresolved
+
+        unresolved = await self._call_telegram_api(
+            "messages.GetDialogs", load_config_dialogs
+        )
+        if unresolved:
+            self.log(
+                "Some configured chats were not found in this account dialog list. If sending fails, use @username "
+                f"or open/join the chat with this account first: {sorted(map(str, unresolved))}",
+                level="WARNING",
+            )
+
+    @property
+    def sign_record_file(self):
+        sign_record_dir = self.legacy_task_dir / str(self.user.id)
+        make_dirs(sign_record_dir)
+        return sign_record_dir / "sign_record.json"
+
+    @property
+    def legacy_sign_record_file(self):
+        return self.legacy_task_dir / "sign_record.json"
+
+    def _ask_actions(
+        self, input_: UserInput, available_actions: List[SupportAction] = None
+    ) -> List[ActionT]:
+        print_to_user(f"{input_.index_str}Configure actions in the real check-in order.")
+        available_actions = available_actions or list(SupportAction)
+        actions = []
+        while True:
+            try:
+                local_input_ = UserInput()
+                print_to_user(f"Action {len(actions) + 1}: ")
+                for action in available_actions:
+                    print_to_user(f"  {action.value}: {action.desc}")
+                print_to_user()
+                action_str = local_input_("Choose action number: ").strip()
+                action = SupportAction(int(action_str))
+                if action not in available_actions:
+                    raise ValueError(f"Unsupported action: {action}")
+                if len(actions) == 0 and action not in [
+                    SupportAction.SEND_TEXT,
+                    SupportAction.SEND_DICE,
+                ]:
+                    raise ValueError(
+                        f"The first action must be {SupportAction.SEND_TEXT.desc} or {SupportAction.SEND_DICE.desc}"
+                    )
+                if action == SupportAction.SEND_TEXT:
+                    text = local_input_("Text to send: ")
+                    actions.append(SendTextAction(text=text))
+                elif action == SupportAction.SEND_DICE:
+                    dice = local_input_("Dice emoji to send, for example 🎲 or 🎯: ")
+                    actions.append(SendDiceAction(dice=dice))
+                elif action == SupportAction.CLICK_KEYBOARD_BY_TEXT:
+                    text_of_btn_to_click = local_input_("Button text to click: ")
+                    actions.append(ClickKeyboardByTextAction(text=text_of_btn_to_click))
+                elif action == SupportAction.CHOOSE_OPTION_BY_IMAGE:
+                    print_to_user(
+                        "Image recognition uses the configured LLM. Make sure the model supports images."
+                    )
+                    actions.append(ChooseOptionByImageAction())
+                elif action == SupportAction.REPLY_BY_CALCULATION_PROBLEM:
+                    print_to_user("Calculation prompts use the configured LLM.")
+                    actions.append(ReplyByCalculationProblemAction())
+                elif action == SupportAction.SOLVE_SLOT_MACHINE_CAPTCHA:
+                    print_to_user(
+                        "Slot-machine captcha solving is conditional. Leave every condition empty to disable this action."
+                    )
+                    if_dice_emoji = (
+                        local_input_(
+                            "Only solve when dice emoji matches, for example 🎰: "
+                        )
+                        .strip()
+                        or None
+                    )
+                    if_text = (
+                        local_input_("Only solve when message text contains (optional): ")
+                        .strip()
+                        or None
+                    )
+                    if_regex = (
+                        local_input_("Only solve when message text matches regex (optional): ")
+                        .strip()
+                        or None
+                    )
+                    actions.append(
+                        SolveSlotMachineCaptchaAction(
+                            if_dice_emoji=if_dice_emoji,
+                            if_text=if_text,
+                            if_regex=if_regex,
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unsupported action: {action}")
+                if local_input_("Add another action? (y/N): ").strip().lower() != "y":
+                    break
+            except (ValueError, ValidationError) as e:
+                print_to_user("Error: ")
+                print_to_user(e)
+        input_.incr()
+        return actions
+
+    def ask_one(self) -> SignChatV3:
+        input_ = UserInput()
+        chat_id = parse_chat_id_or_username(
+            input_("Chat ID or @username: ")
+        )
+        name = input_("Chat name (optional): ")
+        use_message_thread = (
+            input_("Send to a topic (message_thread_id)? (y/N): ").strip().lower()
+            == "y"
+        )
+        message_thread_id = None
+        if use_message_thread:
+            message_thread_id = int(input_("message_thread_id: "))
+        actions = self._ask_actions(input_)
+        delete_after = (
+            input_(
+                "Delete after N seconds (0 deletes immediately; press Enter to keep): "
+            )
+            or None
+        )
+        if delete_after:
+            delete_after = int(delete_after)
+        cfgs = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "name": name,
+            "delete_after": delete_after,
+            "actions": actions,
+        }
+        return SignChatV3.model_validate(cfgs)
+
+    def ask_for_config(self) -> "SignConfigV3":
+        chats = []
+        i = 1
+        print_to_user(f"Configuring task<{self.task_name}>\n")
+        while True:
+            print_to_user(f"Task item {i}: ")
+            try:
+                chat = self.ask_one()
+                print_to_user(chat)
+                print_to_user(f"Task item {i} configured successfully\n")
+                chats.append(chat)
+            except Exception as e:
+                print_to_user(e)
+                print_to_user("Configuration failed")
+                i -= 1
+            continue_ = input("Add another chat? (y/N): ")
+            if continue_.strip().lower() != "y":
+                break
+            i += 1
+        sign_at_prompt = "Check-in time, such as 06:00:00 or 0 6 * * *: "
+        sign_at_str = input(sign_at_prompt) or "06:00:00"
+        while not (sign_at := self._validate_sign_at(sign_at_str)):
+            print_to_user("Enter a valid time or cron expression")
+            sign_at_str = input(sign_at_prompt) or "06:00:00"
+
+        random_seconds_str = input("Random delay seconds (default 0): ") or "0"
+        random_seconds = int(float(random_seconds_str))
+        config = SignConfigV3.model_validate(
+            {
+                "chats": chats,
+                "sign_at": sign_at,
+                "random_seconds": random_seconds,
+            }
+        )
+        if config.requires_ai:
+            print_to_user(OPENAI_USE_PROMPT)
+        return config
+
+    def _validate_sign_at(
+        self,
+        sign_at_str: str,
+    ) -> Optional[str]:
+        sign_at_str = sign_at_str.replace("：", ":").strip()
+
+        try:
+            sign_at = dt_time.fromisoformat(sign_at_str)
+            crontab_expr = self._time_to_crontab(sign_at)
+        except ValueError:
+            try:
+                croniter(sign_at_str)
+                crontab_expr = sign_at_str
+            except CroniterBadCronError:
+                self.log(f"Invalid time format: {sign_at_str}", level="error")
+                return None
+        return crontab_expr
+
+    @staticmethod
+    def _time_to_crontab(sign_at: dt_time) -> str:
+        return f"{sign_at.minute} {sign_at.hour} * * *"
+
+    def load_sign_record(self):
+        user_id = str(self.user.id)
+        store = self.sign_record_store
+        if not store.has_records(self.task_name, user_id):
+            # Import legacy JSON lazily so existing workdirs keep working
+            # without requiring an explicit migration step first.
+            imported_paths = []
+            if store.import_json_file(
+                self.task_name,
+                user_id,
+                self.sign_record_file,
+                account=self._account,
+            ):
+                imported_paths.append(self.sign_record_file)
+            if store.import_json_file(
+                self.task_name,
+                user_id,
+                self.legacy_sign_record_file,
+                account=self._account,
+            ):
+                imported_paths.append(self.legacy_sign_record_file)
+            if imported_paths:
+                joined_paths = ", ".join(str(path) for path in imported_paths)
+                self.log(
+                    f"Legacy sign_record.json files were imported into SQLite: {joined_paths}. Run `telegram-signer <account> migrate-records` to migrate all legacy records.",
+                    level="WARNING",
+                )
+        return store.load_records(self.task_name, user_id)
+
+    def persist_sign_record(
+        self, sign_record: dict[str, str], sign_date: str, signed_at: str
+    ) -> None:
+        sign_record[sign_date] = signed_at
+        self.sign_record_store.upsert_record(
+            self.task_name,
+            str(self.user.id),
+            sign_date,
+            signed_at,
+            account=self._account,
+        )
+
+    async def sign_a_chat(
+        self,
+        chat: SignChatV3,
+    ):
+        self.log(f"Starting: \n{chat}")
+        for action in chat.actions:
+            self.log(f"Waiting for action: {action}")
+            await self.wait_for(chat, action)
+            self.log(f"Action completed: {action}")
+            self.context.waiting_message = None
+            await asyncio.sleep(chat.action_interval)
+
+    async def run(
+        self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
+    ):
+        if self.app.in_memory or self.app.session_string:
+            return await self.in_memory_run(
+                num_of_dialogs, only_once=only_once, force_rerun=force_rerun
+            )
+        return await self.normal_run(
+            num_of_dialogs, only_once=only_once, force_rerun=force_rerun
+        )
+
+    async def in_memory_run(
+        self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
+    ):
+        async with self.app:
+            await self.normal_run(
+                num_of_dialogs, only_once=only_once, force_rerun=force_rerun
+            )
+
+    async def normal_run(
+        self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
+    ):
+        if self.user is None:
+            await self.login(num_of_dialogs, print_chat=True)
+
+        config = self.load_config(self.cfg_cls)
+        if config.requires_ai:
+            self.ensure_ai_cfg()
+
+        sign_record = self.load_sign_record()
+        chat_ids = [c.chat_id for c in config.chats]
+
+        async def sign_once():
+            for chat in config.chats:
+                route_key = None
+                try:
+                    route_key = await self.resolve_chat_route_key(chat)
+                    self.context.sign_chats[route_key].append(chat)
+                    await self.sign_a_chat(chat)
+                except errors.RPCError as _e:
+                    self.log(f"Check-in failed: {_e} \nchat: \n{chat}")
+                    logger.warning(_e, exc_info=True)
+                    continue
+
+                if route_key is not None:
+                    self.context.chat_messages[route_key].clear()
+                await asyncio.sleep(config.sign_interval)
+            self.persist_sign_record(sign_record, str(now.date()), now.isoformat())
+
+        def need_sign(last_date_str):
+            if force_rerun:
+                return True
+            if last_date_str not in sign_record:
+                return True
+            _last_sign_at = datetime.fromisoformat(sign_record[last_date_str])
+            self.log(f"Last run time: {_last_sign_at}")
+            _cron_it = croniter(self._validate_sign_at(config.sign_at), _last_sign_at)
+            _next_run: datetime = _cron_it.next(datetime)
+            if _next_run > now:
+                self.log("Not time to run yet")
+                return False
+            return True
+
+        while True:
+            self.log(f"Registering message handlers for chats：{chat_ids}")
+            self.app.add_handler(MessageHandler(self.on_message))
+            self.app.add_handler(EditedMessageHandler(self.on_edited_message))
+            try:
+                async with self.app:
+                    now = get_now()
+                    self.log(f"Current time: {now}")
+                    now_date_str = str(now.date())
+                    self.context = self.ensure_ctx()
+                    await self.ensure_config_chats_seen(config)
+                    if need_sign(now_date_str):
+                        await sign_once()
+
+            except (OSError, errors.Unauthorized) as e:
+                logger.exception(e)
+                await asyncio.sleep(30)
+                continue
+
+            if only_once:
+                break
+            cron_it = croniter(self._validate_sign_at(config.sign_at), now)
+            next_run: datetime = cron_it.next(datetime) + timedelta(
+                seconds=random.randint(0, int(config.random_seconds))
+            )
+            self.log(f"Next run time: {next_run}")
+            await asyncio.sleep((next_run - now).total_seconds())
+
+    async def force_run(self, num_of_dialogs):
+        return await self.run(num_of_dialogs, only_once=True, force_rerun=True)
+
+    async def send_text(
+        self,
+        chat_id: Union[int, str],
+        text: str,
+        delete_after: int = None,
+        message_thread_id: Optional[int] = None,
+        **kwargs,
+    ):
+        if self.user is None:
+            await self.login(print_chat=False)
+        async with self.app:
+            await self.send_message(
+                chat_id,
+                text,
+                delete_after,
+                message_thread_id=message_thread_id,
+                **kwargs,
+            )
+
+    async def send_dice_cli(
+        self,
+        chat_id: Union[str, int],
+        emoji: str = "🎲",
+        delete_after: int = None,
+        message_thread_id: Optional[int] = None,
+        **kwargs,
+    ):
+        if self.user is None:
+            await self.login(print_chat=False)
+        async with self.app:
+            await self.send_dice(
+                chat_id,
+                emoji,
+                delete_after,
+                message_thread_id=message_thread_id,
+                **kwargs,
+            )
+
+    async def _on_message(self, client: Client, message: Message):
+        message_thread_id = getattr(message, "message_thread_id", None)
+        route_key = self.get_route_key(message.chat.id, message_thread_id)
+        chats = self.context.sign_chats.get(route_key)
+        if not chats and message_thread_id is not None:
+            route_key = self.get_route_key(message.chat.id, None)
+            chats = self.context.sign_chats.get(route_key)
+        if not chats:
+            self.log("Ignoring an unexpected chat", level="WARNING")
+            return
+        self.context.chat_messages[route_key][message.id] = message
+
+    async def on_message(self, client: Client, message: Message):
+        sender = getattr(message, "from_user", None)
+        sender_name = getattr(sender, "username", None) or getattr(sender, "id", None)
+        self.log(
+            f"Received message from {sender_name or '-'}: {readable_message(message)}"
+        )
+        await self._on_message(client, message)
+
+    async def on_edited_message(self, client, message: Message):
+        sender = getattr(message, "from_user", None)
+        sender_name = getattr(sender, "username", None) or getattr(sender, "id", None)
+        self.log(
+            f"Received edited message from {sender_name or '-'}: {readable_message(message)}"
+        )
+        # Wait while the original message is being handled.
+        while (
+            self.context.waiting_message
+            and self.context.waiting_message.id == message.id
+        ):
+            await asyncio.sleep(0.3)
+        await self._on_message(client, message)
+
+    async def _click_keyboard_by_text(
+        self, action: ClickKeyboardByTextAction, message: Message
+    ):
+        if reply_markup := message.reply_markup:
+            if isinstance(reply_markup, InlineKeyboardMarkup):
+                flat_buttons = (b for row in reply_markup.inline_keyboard for b in row)
+                option_to_btn: dict[str, InlineKeyboardButton] = {}
+                for btn in flat_buttons:
+                    option_to_btn[btn.text] = btn
+                    if action.text in btn.text:
+                        self.log(f"Click button: {btn.text}")
+                        await self.request_callback_answer(
+                            self.app,
+                            message.chat.id,
+                            message.id,
+                            btn.callback_data,
+                        )
+                        return True
+        return False
+
+    async def _reply_by_calculation_problem(
+        self, action: ReplyByCalculationProblemAction, message
+    ):
+        if message.text:
+            self.log("Text prompt detected; asking the LLM for the calculation answer")
+            self.log(f"Question: \n{message.text}")
+            answer = await self.get_ai_tools().calculate_problem(message.text)
+            self.log(f"Answer: {answer}")
+            await self.send_message(
+                message.chat.id,
+                answer,
+                message_thread_id=getattr(message, "message_thread_id", None),
+            )
+            return True
+        return False
+
+    async def _choose_option_by_image(self, action: ChooseOptionByImageAction, message):
+        if reply_markup := message.reply_markup:
+            if isinstance(reply_markup, InlineKeyboardMarkup) and message.photo:
+                flat_buttons = (b for row in reply_markup.inline_keyboard for b in row)
+                option_to_btn = {btn.text: btn for btn in flat_buttons if btn.text}
+                self.log("Image prompt detected; asking the LLM to choose an option")
+                image_buffer: BinaryIO = await self.app.download_media(
+                    message.photo.file_id, in_memory=True
+                )
+                image_buffer.seek(0)
+                image_bytes = image_buffer.read()
+                options = list(option_to_btn)
+                result_index = await self.get_ai_tools().choose_option_by_image(
+                    image_bytes,
+                    "Choose the correct option",
+                    list(enumerate(options)),
+                )
+                result = options[result_index]
+                self.log(f"Selected option: {result}")
+                target_btn = option_to_btn.get(result.strip())
+                if not target_btn:
+                    self.log("No matching button found", level="WARNING")
+                    return False
+                await self.request_callback_answer(
+                    self.app,
+                    message.chat.id,
+                    message.id,
+                    target_btn.callback_data,
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _slot_machine_symbols(value: int) -> tuple[str, str, str]:
+        if value < 1 or value > 64:
+            raise ValueError(f"invalid slot machine dice value: {value}")
+        zero_based = value - 1
+        return (
+            SLOT_MACHINE_SYMBOLS[zero_based & 3],
+            SLOT_MACHINE_SYMBOLS[(zero_based >> 2) & 3],
+            SLOT_MACHINE_SYMBOLS[(zero_based >> 4) & 3],
+        )
+
+    @staticmethod
+    def _normalize_slot_button_text(text: str) -> str:
+        return re.sub(r"\s+", "", text.strip().lower().replace("\ufe0f", ""))
+
+    @classmethod
+    def _button_matches_slot_symbol(cls, button_text: str, symbol: str) -> bool:
+        normalized = cls._normalize_slot_button_text(button_text)
+        aliases = {
+            cls._normalize_slot_button_text(alias)
+            for alias in SLOT_MACHINE_SYMBOL_ALIASES[symbol]
+        }
+        return normalized in aliases or any(alias in normalized for alias in aliases)
+
+    @classmethod
+    def _is_slot_back_button(cls, button_text: str) -> bool:
+        normalized = cls._normalize_slot_button_text(button_text)
+        return (
+            "back" in normalized
+            or "return" in normalized
+            or "返回" in normalized
+            or "退回" in normalized
+            or "↩" in normalized
+            or "←" in normalized
+            or "⬅" in normalized
+            or "🔙" in normalized
+            or "◀" in normalized
+        )
+
+    @classmethod
+    def _find_slot_machine_button(cls, flat_buttons: list, symbol: str):
+        target_btn = next(
+            (
+                btn
+                for btn in flat_buttons
+                if btn.text and cls._button_matches_slot_symbol(btn.text, symbol)
+            ),
+            None,
+        )
+        if target_btn or symbol != "bar":
+            return target_btn
+
+        # Some bots render BAR as black blocks instead of the literal text.
+        # In the fixed layout, BAR is the only non-back button that is not
+        # grape, lemon, or 7, so use that as a fallback.
+        fallback_buttons = []
+        for btn in flat_buttons:
+            if not btn.text:
+                continue
+            if cls._is_slot_back_button(btn.text):
+                continue
+            if any(
+                cls._button_matches_slot_symbol(btn.text, other_symbol)
+                for other_symbol in ("grapes", "lemon", "seven")
+            ):
+                continue
+            fallback_buttons.append(btn)
+        if len(fallback_buttons) == 1:
+            return fallback_buttons[0]
+        return None
+
+    def _slot_machine_condition_matches(
+        self, action: SolveSlotMachineCaptchaAction, message: Message
+    ) -> bool:
+        if not action.has_condition:
+            return False
+
+        dice = getattr(message, "dice", None)
+        if action.if_dice_emoji and (
+            not dice or getattr(dice, "emoji", None) != action.if_dice_emoji
+        ):
+            return False
+
+        message_text = (
+            getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        )
+        if action.if_text and action.if_text not in message_text:
+            return False
+        if action.if_regex:
+            try:
+                if not re.search(action.if_regex, message_text):
+                    return False
+            except re.error as exc:
+                self.log(f"Invalid slot-machine captcha regex: {exc}", level="ERROR")
+                return False
+        return True
+
+    async def _solve_slot_machine_captcha(
+        self,
+        action: SolveSlotMachineCaptchaAction,
+        message: Message,
+        route_key: RouteKey,
+    ):
+        dice = getattr(message, "dice", None)
+        if dice and getattr(dice, "emoji", None) == SLOT_MACHINE_EMOJI:
+            if action.if_dice_emoji and dice.emoji != action.if_dice_emoji:
+                return False
+            self.context.slot_machine_results[route_key] = (
+                dice.value,
+                self._slot_machine_symbols(dice.value),
+            )
+
+        if not (reply_markup := message.reply_markup):
+            return False
+        if not isinstance(reply_markup, InlineKeyboardMarkup):
+            return False
+
+        if dice and getattr(dice, "emoji", None) == SLOT_MACHINE_EMOJI:
+            slot_value, symbols = dice.value, self._slot_machine_symbols(dice.value)
+        elif route_key in self.context.slot_machine_results:
+            if action.if_text or action.if_regex:
+                text_action = SolveSlotMachineCaptchaAction(
+                    if_text=action.if_text,
+                    if_regex=action.if_regex,
+                )
+                if not self._slot_machine_condition_matches(text_action, message):
+                    return False
+            slot_value, symbols = self.context.slot_machine_results[route_key]
+        else:
+            return False
+
+        flat_buttons = [b for row in reply_markup.inline_keyboard for b in row]
+        available_buttons = [
+            f"text={btn.text!r}, normalized={self._normalize_slot_button_text(btn.text or '')!r}, callback={getattr(btn, 'callback_data', None)!r}"
+            for btn in flat_buttons
+        ]
+        self.log(
+            f"Slot-machine captcha value={slot_value}, symbols={symbols}, buttons={available_buttons}"
+        )
+        for symbol in symbols:
+            target_btn = self._find_slot_machine_button(flat_buttons, symbol)
+            if target_btn is None:
+                self.log(
+                    f"Slot-machine captcha button not found: symbol={symbol}, value={slot_value}, buttons={available_buttons}",
+                    level="WARNING",
+                )
+                return False
+            self.log(f"Click slot-machine captcha button: {target_btn.text}")
+            await self.request_callback_answer(
+                self.app,
+                message.chat.id,
+                message.id,
+                target_btn.callback_data,
+            )
+        self.context.slot_machine_results.pop(route_key, None)
+        return True
+
+    async def wait_for(self, chat: SignChatV3, action: ActionT, timeout=10):
+        if isinstance(action, SendTextAction):
+            return await self.send_message(
+                chat.chat_id,
+                action.text,
+                chat.delete_after,
+                message_thread_id=chat.message_thread_id,
+            )
+        elif isinstance(action, SendDiceAction):
+            return await self.send_dice(
+                chat.chat_id,
+                action.dice,
+                chat.delete_after,
+                message_thread_id=chat.message_thread_id,
+            )
+        if (
+            isinstance(action, SolveSlotMachineCaptchaAction)
+            and not action.has_condition
+        ):
+            self.log("Slot-machine captcha action has no condition; skipping it.")
+            return None
+        route_key = self.get_runtime_route_key(chat)
+        self.context.waiter.add(route_key)
+        start = time.perf_counter()
+        last_message = None
+        while time.perf_counter() - start < timeout:
+            await asyncio.sleep(0.3)
+            messages_dict = self.context.chat_messages.get(route_key)
+            if not messages_dict:
+                continue
+            messages = list(messages_dict.values())
+            # No new message yet
+            if messages[-1] == last_message:
+                continue
+            last_message = messages[-1]
+            for message in messages:
+                self.context.waiting_message = message
+                ok = False
+                if isinstance(action, ClickKeyboardByTextAction):
+                    ok = await self._click_keyboard_by_text(action, message)
+                elif isinstance(action, ReplyByCalculationProblemAction):
+                    ok = await self._reply_by_calculation_problem(action, message)
+                elif isinstance(action, ChooseOptionByImageAction):
+                    ok = await self._choose_option_by_image(action, message)
+                elif isinstance(action, SolveSlotMachineCaptchaAction):
+                    ok = await self._solve_slot_machine_captcha(
+                        action, message, route_key
+                    )
+                if ok:
+                    self.context.waiter.sub(route_key)
+                    # Mark the message as handled while preserving edited-message order
+                    self.context.chat_messages[route_key][message.id] = None
+                    return None
+                self.log(f"Ignoring message: {readable_message(message)}")
+        self.log(f"Wait timed out: \nchat: \n{chat} \naction: {action}", level="WARNING")
+        return None
+
+    async def request_callback_answer(
+        self,
+        client: Client,
+        chat_id: Union[int, str],
+        message_id: int,
+        callback_data: Union[str, bytes],
+        **kwargs,
+    ):
+        try:
+            await self._call_telegram_api(
+                "messages.GetBotCallbackAnswer",
+                lambda: client.request_callback_answer(
+                    chat_id,
+                    message_id,
+                    callback_data=callback_data,
+                    **kwargs,
+                ),
+            )
+            self.log("Click completed")
+        except (errors.BadRequest, TimeoutError) as e:
+            self.log(e, level="ERROR")
+
+
+
+
+
+

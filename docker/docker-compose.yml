@@ -1,0 +1,21 @@
+networks:
+  tg_host:
+    external: false
+
+services:
+  telegram-signer:
+    build:
+      context: ..
+      dockerfile: docker/CN.Dockerfile
+      args:
+        TZ: ${TZ:-Asia/Shanghai}
+    container_name: telegram-signer
+    command: ["telegram-signer", "account_a", "run", "task_name"]
+    volumes:
+      - $PWD:/opt/telegram-signer
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    networks:
+      - tg_host
+    restart: unless-stopped
+

@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-signer"
+dynamic = ["version"]
+description = "Telegram check-in scheduler with keyboard clicks and optional AI-assisted captcha handling."
+authors = [
+    { name = "Telegram Signer Contributors" }
+]
+license = { text = "BSD-3-Clause" }
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only"
+]
+dependencies = [
+    "kurigram>=2.2.19,<2.3.0",
+    "click",
+    "pydantic",
+    "openai",
+    "croniter",
+    "json_repair",
+    "typing-extensions",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.6",
+    "tox>=4.32.0",
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/git-buster/telegram-signer"
+Repository = "https://github.com/git-buster/telegram-signer"
+
+[project.scripts]
+telegram-signer = "telegram_signer.__main__:signer"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "telegram_signer.__version__" }
+
+[tool.setuptools.packages.find]
+exclude = ["tests*"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+extend-select = [
+    "I", # isort
+    "B", # flake8-bugbear
+    "W", # pycodestyle
+    "C4", # flake8-comprehensions
+]
+ignore = [
+    "E501", # line too long, handled by black
+    "B008", # do not perform function calls in argument defaults
+    "C901", # too complex
+    "W191", # indentation contains tabs
+    "B019", # Use of `functools.lru_cache` or `functools.cache` on methods can lead to memory leaks
+    "B904"  # raise without from inside except
+]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+    "-vv",
+    "-x",
+    "-W=ignore::DeprecationWarning:pyrogram.utils"
+]
+
