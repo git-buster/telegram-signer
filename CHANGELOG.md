@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.7 - 2026-05-07
+
+- Add attribution to `https://github.com/amchii/tg-signer` in the public README.
+- Rewrite README in Traditional Chinese, Simplified Chinese, and English, with Traditional Chinese first.
+- Document simplified release contents, added GitHub Actions friendly features, slot-machine captcha handling, and privacy separation.
+
 ## 1.0.6 - 2026-05-02
 
 - Keep public README content English-only.
